@@ -20,7 +20,7 @@ struct CodexUsage {
 
 final class UsageReader {
     private let sessionsURL: URL
-    private let logsURL: URL
+    private let authURL: URL
     private let fileManager = FileManager.default
     private let fractionalISOFormatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
@@ -37,70 +37,62 @@ final class UsageReader {
         let codexURL = URL(fileURLWithPath: NSHomeDirectory())
             .appendingPathComponent(".codex", isDirectory: true)
         sessionsURL = codexURL.appendingPathComponent("sessions", isDirectory: true)
-        logsURL = codexURL.appendingPathComponent("logs_2.sqlite")
+        authURL = codexURL.appendingPathComponent("auth.json")
     }
 
     func latestUsage() -> CodexUsage? {
-        let logUsage = latestUsageFromRuntimeLogs()
-        let sessionUsage = latestUsageFromSessionFiles()
-
-        switch (logUsage, sessionUsage) {
-        case let (log?, session?):
-            return log.sourceDate >= session.sourceDate ? log : session
-        case let (log?, nil):
-            return log
-        case let (nil, session?):
-            return session
-        case (nil, nil):
-            return nil
-        }
+        latestUsageFromWhamAPI() ?? latestUsageFromSessionFiles()
     }
 
-    private func latestUsageFromRuntimeLogs() -> CodexUsage? {
-        guard fileManager.fileExists(atPath: logsURL.path) else { return nil }
+    private func latestUsageFromWhamAPI() -> CodexUsage? {
+        guard let token = accessToken() else { return nil }
+        guard let url = URL(string: "https://chatgpt.com/backend-api/wham/usage") else { return nil }
 
-        let sql = """
-        select ts, ts_nanos, feedback_log_body from logs
-        where target = 'codex_api::endpoint::responses_websocket'
-          and feedback_log_body like '%websocket event: {"type":"codex.rate_limits"%'
-        order by id desc limit 20;
-        """
+        var request = URLRequest(url: url, timeoutInterval: 8)
+        request.httpMethod = "GET"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("en", forHTTPHeaderField: "OAI-Language")
+        request.setValue("Codex Desktop", forHTTPHeaderField: "originator")
+        request.setValue("codex_desktop", forHTTPHeaderField: "OpenAI-Beta")
 
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
-        process.arguments = ["-separator", "\u{1f}", logsURL.path, sql]
+        var resultData: Data?
+        let semaphore = DispatchSemaphore(value: 0)
+        URLSession.shared.dataTask(with: request) { data, response, _ in
+            if let httpResponse = response as? HTTPURLResponse,
+               (200..<300).contains(httpResponse.statusCode) {
+                resultData = data
+            }
+            semaphore.signal()
+        }.resume()
 
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = Pipe()
-
-        do {
-            try process.run()
-        } catch {
+        guard semaphore.wait(timeout: .now() + 10) == .success,
+              let data = resultData,
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let limits = object["rate_limit"] as? [String: Any],
+              let primaryObject = limits["primary_window"] as? [String: Any],
+              let secondaryObject = limits["secondary_window"] as? [String: Any],
+              let primary = parseWindow(primaryObject),
+              let secondary = parseWindow(secondaryObject) else {
             return nil
         }
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else { return nil }
 
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        guard let text = String(data: data, encoding: .utf8) else { return nil }
+        return CodexUsage(
+            primary: primary,
+            secondary: secondary,
+            planType: "codex",
+            sourceDate: Date()
+        )
+    }
 
-        var bestUsage: CodexUsage?
-        for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
-            let fields = line.split(separator: "\u{1f}", maxSplits: 2, omittingEmptySubsequences: false)
-            guard fields.count == 3,
-                  let seconds = TimeInterval(fields[0]),
-                  let nanos = TimeInterval(fields[1]) else {
-                continue
-            }
-
-            let sourceDate = Date(timeIntervalSince1970: seconds + nanos / 1_000_000_000)
-            if let usage = parseRuntimeLog(String(fields[2]), sourceDate: sourceDate),
-               bestUsage == nil || usage.sourceDate > bestUsage!.sourceDate {
-                bestUsage = usage
-            }
+    private func accessToken() -> String? {
+        guard let data = try? Data(contentsOf: authURL),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tokens = object["tokens"] as? [String: Any],
+              let token = tokens["access_token"] as? String,
+              !token.isEmpty else {
+            return nil
         }
-        return bestUsage
+        return token
     }
 
     private func latestUsageFromSessionFiles() -> CodexUsage? {
@@ -118,28 +110,6 @@ final class UsageReader {
             }
         }
         return bestUsage
-    }
-
-    private func parseRuntimeLog(_ text: String, sourceDate: Date) -> CodexUsage? {
-        guard let range = text.range(of: "websocket event: ") else { return nil }
-        let jsonText = String(text[range.upperBound...])
-        guard let data = jsonText.data(using: .utf8),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              object["type"] as? String == "codex.rate_limits",
-              let limits = object["rate_limits"] as? [String: Any],
-              let primaryObject = limits["primary"] as? [String: Any],
-              let secondaryObject = limits["secondary"] as? [String: Any],
-              let primary = parseWindow(primaryObject),
-              let secondary = parseWindow(secondaryObject) else {
-            return nil
-        }
-
-        return CodexUsage(
-            primary: primary,
-            secondary: secondary,
-            planType: object["plan_type"] as? String ?? "codex",
-            sourceDate: sourceDate
-        )
     }
 
     private func enumeratorJSONLFiles() -> [URL]? {
@@ -215,15 +185,31 @@ final class UsageReader {
     }
 
     private func parseWindow(_ object: [String: Any]) -> LimitWindow? {
-        guard let used = object["used_percent"] as? Double ?? (object["used_percent"] as? Int).map(Double.init),
-              let minutes = object["window_minutes"] as? Int,
-              let reset = object["resets_at"] as? Double
-                ?? (object["resets_at"] as? Int).map(Double.init)
-                ?? object["reset_at"] as? Double
-                ?? (object["reset_at"] as? Int).map(Double.init) else {
+        let used = doubleValue(object["used_percent"])
+        let minutes = intValue(object["window_minutes"])
+            ?? intValue(object["limit_window_seconds"]).map { $0 / 60 }
+        let reset = doubleValue(object["resets_at"])
+            ?? doubleValue(object["reset_at"])
+            ?? doubleValue(object["reset_after_seconds"]).map { Date().timeIntervalSince1970 + $0 }
+
+        guard let used, let minutes, let reset else {
             return nil
         }
         return LimitWindow(usedPercent: used, windowMinutes: minutes, resetsAt: reset)
+    }
+
+    private func doubleValue(_ value: Any?) -> Double? {
+        if let double = value as? Double { return double }
+        if let int = value as? Int { return Double(int) }
+        if let number = value as? NSNumber { return number.doubleValue }
+        return nil
+    }
+
+    private func intValue(_ value: Any?) -> Int? {
+        if let int = value as? Int { return int }
+        if let double = value as? Double { return Int(double) }
+        if let number = value as? NSNumber { return number.intValue }
+        return nil
     }
 }
 
@@ -371,7 +357,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         resizeAndPlace()
         window.orderFrontRegardless()
 
-        timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             self?.update()
         }
     }
