@@ -2,6 +2,8 @@
 
 macOS 顶部悬浮窗，用灵动岛样式显示 Codex 当前 5 小时和 1 周用量窗口的剩余百分比。
 
+![Codex 灵动岛截图](Resources/screenshot.png)
+
 ## 功能
 
 - 显示 5 小时窗口剩余用量
