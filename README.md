@@ -8,15 +8,27 @@ macOS 顶部悬浮窗，用灵动岛样式显示 Codex 当前 5 小时和 1 周�
 
 - 显示 5 小时窗口剩余用量
 - 显示 1 周窗口剩余用量
-- 每 5 秒从本机 Codex 会话日志刷新
+- 启动时立即刷新，之后每 60 秒刷新一次
 - 点击展开详情，右键退出
 - 支持安装为开机自启
 
 ## 数据来源
 
-应用只读取本机 `~/.codex/sessions` 下 Codex 写入的 `rate_limits` 快照，不联网、不上传数据。
+v1.0.2 起，应用优先读取 Codex 设置菜单同源的官方用量接口：
+
+```text
+https://chatgpt.com/backend-api/wham/usage
+```
+
+应用会从本机 `~/.codex/auth.json` 读取 Codex 登录令牌，只用于请求当前账号的用量状态。接口不可用时，才会退回读取本机 `~/.codex/sessions` 下 Codex 写入的 `rate_limits` 快照。
 
 显示值和 Codex 设置菜单一致：`100 - used_percent`，即剩余百分比。
+
+## 下载
+
+最新版安装包在 GitHub Releases：
+
+https://github.com/ljbljb007/codex-lingdongdao/releases/latest
 
 ## 构建
 
