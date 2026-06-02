@@ -20,6 +20,7 @@ struct CodexUsage {
 
 final class UsageReader {
     private let sessionsURL: URL
+    private let logsURL: URL
     private let fileManager = FileManager.default
     private let fractionalISOFormatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
@@ -33,11 +34,76 @@ final class UsageReader {
     }()
 
     init() {
-        sessionsURL = URL(fileURLWithPath: NSHomeDirectory())
-            .appendingPathComponent(".codex/sessions", isDirectory: true)
+        let codexURL = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent(".codex", isDirectory: true)
+        sessionsURL = codexURL.appendingPathComponent("sessions", isDirectory: true)
+        logsURL = codexURL.appendingPathComponent("logs_2.sqlite")
     }
 
     func latestUsage() -> CodexUsage? {
+        let logUsage = latestUsageFromRuntimeLogs()
+        let sessionUsage = latestUsageFromSessionFiles()
+
+        switch (logUsage, sessionUsage) {
+        case let (log?, session?):
+            return log.sourceDate >= session.sourceDate ? log : session
+        case let (log?, nil):
+            return log
+        case let (nil, session?):
+            return session
+        case (nil, nil):
+            return nil
+        }
+    }
+
+    private func latestUsageFromRuntimeLogs() -> CodexUsage? {
+        guard fileManager.fileExists(atPath: logsURL.path) else { return nil }
+
+        let sql = """
+        select ts, ts_nanos, feedback_log_body from logs
+        where target = 'codex_api::endpoint::responses_websocket'
+          and feedback_log_body like '%websocket event: {"type":"codex.rate_limits"%'
+        order by id desc limit 20;
+        """
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+        process.arguments = ["-separator", "\u{1f}", logsURL.path, sql]
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+
+        do {
+            try process.run()
+        } catch {
+            return nil
+        }
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { return nil }
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let text = String(data: data, encoding: .utf8) else { return nil }
+
+        var bestUsage: CodexUsage?
+        for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
+            let fields = line.split(separator: "\u{1f}", maxSplits: 2, omittingEmptySubsequences: false)
+            guard fields.count == 3,
+                  let seconds = TimeInterval(fields[0]),
+                  let nanos = TimeInterval(fields[1]) else {
+                continue
+            }
+
+            let sourceDate = Date(timeIntervalSince1970: seconds + nanos / 1_000_000_000)
+            if let usage = parseRuntimeLog(String(fields[2]), sourceDate: sourceDate),
+               bestUsage == nil || usage.sourceDate > bestUsage!.sourceDate {
+                bestUsage = usage
+            }
+        }
+        return bestUsage
+    }
+
+    private func latestUsageFromSessionFiles() -> CodexUsage? {
         guard let files = enumeratorJSONLFiles() else { return nil }
         let sortedFiles = files.sorted {
             modificationDate($0) > modificationDate($1)
@@ -52,6 +118,28 @@ final class UsageReader {
             }
         }
         return bestUsage
+    }
+
+    private func parseRuntimeLog(_ text: String, sourceDate: Date) -> CodexUsage? {
+        guard let range = text.range(of: "websocket event: ") else { return nil }
+        let jsonText = String(text[range.upperBound...])
+        guard let data = jsonText.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              object["type"] as? String == "codex.rate_limits",
+              let limits = object["rate_limits"] as? [String: Any],
+              let primaryObject = limits["primary"] as? [String: Any],
+              let secondaryObject = limits["secondary"] as? [String: Any],
+              let primary = parseWindow(primaryObject),
+              let secondary = parseWindow(secondaryObject) else {
+            return nil
+        }
+
+        return CodexUsage(
+            primary: primary,
+            secondary: secondary,
+            planType: object["plan_type"] as? String ?? "codex",
+            sourceDate: sourceDate
+        )
     }
 
     private func enumeratorJSONLFiles() -> [URL]? {
@@ -129,7 +217,10 @@ final class UsageReader {
     private func parseWindow(_ object: [String: Any]) -> LimitWindow? {
         guard let used = object["used_percent"] as? Double ?? (object["used_percent"] as? Int).map(Double.init),
               let minutes = object["window_minutes"] as? Int,
-              let reset = object["resets_at"] as? Double ?? (object["resets_at"] as? Int).map(Double.init) else {
+              let reset = object["resets_at"] as? Double
+                ?? (object["resets_at"] as? Int).map(Double.init)
+                ?? object["reset_at"] as? Double
+                ?? (object["reset_at"] as? Int).map(Double.init) else {
             return nil
         }
         return LimitWindow(usedPercent: used, windowMinutes: minutes, resetsAt: reset)
